@@ -9,88 +9,104 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ==========================================
-# 核心逻辑函数 (基于 v11 修复版)
+# 核心逻辑函数 (基于 v12 深度修复版)
 # ==========================================
 
-def find_sheet_name(sheets, keywords):
-    """根据关键词查找sheet名称"""
-    for sheet_name in sheets:
-        if any(keyword in sheet_name for keyword in keywords):
-            return sheet_name
-    return None
+def clean_header(header_value):
+    """清理表头：转字符串、去空格、统一括号、转小写"""
+    if not header_value:
+        return ""
+    # 转字符串并去空格
+    s = str(header_value).strip().lower()
+    # 统一括号：将全角括号转为半角
+    s = s.replace('（', '(').replace('）', ')')
+    # 去除多余空格
+    s = s.replace(' ', '')
+    return s
 
-def get_cell_value(cell):
-    """获取单元格值，处理空值"""
-    if cell.value is None:
-        return 0
-    val = str(cell.value).strip()
-    if val == '' or val.lower() in ('nan', '#n/a', '#na', 'none', ''):
-        return 0
-    try:
-        if val.startswith('='):
-            return 0
-        return float(val)
-    except (ValueError, TypeError):
-        return val
+def find_col_index_smart(sheet, keywords_must, keywords_exclude=None, header_row=1):
+    """
+    智能查找列索引
+    :param keywords_must: 必须包含的关键词列表 (AND关系)
+    :param keywords_exclude: 不能包含的关键词列表
+    :return: 列索引 (1-based) 或 None
+    """
+    if keywords_exclude is None:
+        keywords_exclude = []
+        
+    best_col = None
+    best_score = 0 # 用于区分"标发在途"和"标发在途(数量)"，优先匹配更长的/带'数量'的
+    
+    # 遍历前50列
+    for col in range(1, 51):
+        val = sheet.cell(row=header_row, column=col).value
+        if not val: continue
+        
+        header_clean = clean_header(val)
+        
+        # 1. 检查必须包含的词
+        if not all(k.lower() in header_clean for k in keywords_must):
+            continue
+            
+        # 2. 检查必须排除的词
+        if any(k.lower() in header_clean for k in keywords_exclude):
+            continue
+            
+        # 3. 评分机制：如果包含"数量"或"qty"，优先级更高
+        current_score = 1
+        if '数量' in header_clean or 'qty' in header_clean or '件数' in header_clean:
+            current_score += 2
+            
+        # 如果是第一次找到，或者当前列分数更高，则更新
+        if best_col is None or current_score > best_score:
+            best_col = col
+            best_score = current_score
+            
+    return best_col
 
 def get_numeric_value(cell):
-    """获取数值"""
+    """获取数值，强制转float，异常返回0"""
     if cell is None or cell.value is None:
         return 0
     val = str(cell.value).strip()
     if val == '' or val.lower() in ('nan', '#n/a', '#na', 'none', ''):
         return 0
     try:
-        if val.startswith('='):
-            return 0
+        if val.startswith('='): return 0
+        # 去除千分位逗号等
+        val = val.replace(',', '')
         return float(val)
     except (ValueError, TypeError):
         return 0
 
 def load_product_reference_from_obj(product_file_obj):
-    """从上传的产品资料表对象中加载sku集合和映射"""
+    """加载产品资料表"""
     sku_set = set()
     sku_to_name = {}
-    
-    if product_file_obj is None:
-        return sku_set, sku_to_name
+    if product_file_obj is None: return sku_set, sku_to_name
 
     try:
         wb_product = openpyxl.load_workbook(product_file_obj, read_only=True)
         ws = wb_product[wb_product.sheetnames[0]]
 
-        sku_col_idx = None
-        name_col_idx = None
-        
-        # 智能查找列头
-        for col_idx in range(1, 10):
-            header = ws.cell(row=1, column=col_idx).value
-            if header:
-                header_str = str(header).strip()
-                if header_str.lower() == 'sku' and sku_col_idx is None:
-                    sku_col_idx = col_idx
-                elif header_str in ['品名', '名称', 'name', 'Name', '品名英'] and name_col_idx is None:
-                    name_col_idx = col_idx
+        sku_col = find_col_index_smart(ws, ['sku'])
+        name_col = find_col_index_smart(ws, ['品名']) or find_col_index_smart(ws, ['名称']) or find_col_index_smart(ws, ['name'])
 
-        if sku_col_idx:
+        if sku_col:
             row_idx = 2
             while True:
                 try:
-                    sku_cell = ws.cell(row=row_idx, column=sku_col_idx)
+                    sku_cell = ws.cell(row=row_idx, column=sku_col)
                     if not sku_cell: break
                     sku_val = str(sku_cell.value).strip() if sku_cell.value else ''
-                except:
-                    break
+                except: break
 
-                if not sku_val:
-                    break
-
+                if not sku_val: break
                 sku_set.add(sku_val)
-                if name_col_idx:
-                    name_cell = ws.cell(row=row_idx, column=name_col_idx)
+                if name_col:
+                    name_cell = ws.cell(row=row_idx, column=name_col)
                     name_val = str(name_cell.value).strip() if name_cell.value else ''
-                    if name_val:
-                        sku_to_name[sku_val] = name_val
+                    if name_val: sku_to_name[sku_val] = name_val
                 row_idx += 1
         wb_product.close()
         return sku_set, sku_to_name
@@ -99,13 +115,11 @@ def load_product_reference_from_obj(product_file_obj):
         return set(), {}
 
 def extract_sku_smart(msku, sku_set):
-    """智能SKU提取逻辑"""
+    """智能SKU提取"""
     if not msku: return '', False
     if not sku_set:
         parts = msku.split('-')
-        if len(parts) >= 2: return parts[1], False
-        elif len(parts) >= 1: return parts[0], False
-        return msku, False
+        return (parts[1] if len(parts)>=2 else parts[0]), False
 
     parts = msku.split('-')
     parts = [p.strip() for p in parts if p.strip()]
@@ -113,391 +127,340 @@ def extract_sku_smart(msku, sku_set):
     # 1. 精确匹配
     for part in parts:
         if part in sku_set: return part, True
-
-    # 2. 去除特殊字符匹配
-    cleaned_parts = []
-    for part in parts:
-        cleaned = part.replace('"', '').replace("'", '').replace(' ', '')
-        if cleaned: cleaned_parts.append(cleaned)
+    
+    # 2. 去符号匹配
+    cleaned_parts = [p.replace('"', '').replace("'", '').replace(' ', '') for p in parts]
     for part in cleaned_parts:
         if part in sku_set: return part, True
 
-    # 3. 模糊/子串匹配
+    # 3. 模糊匹配 (SKU通常由字母数字组成且长度>4)
     for part in cleaned_parts:
-        if len(part) >= 4:
+        if len(part) >= 4 and re.search(r'\d', part) and re.search(r'[a-zA-Z]', part):
+            if part in sku_set: return part, True
+            # 子串检查
             for sku in sku_set:
                 if part in sku or sku in part:
-                    if len(sku) > 0 and (len(part) / len(sku) >= 0.5):
+                    if len(sku) > 0 and len(part)/len(sku) >= 0.6:
                         return sku, True
-    
-    # 4. 字母数字组合回退
-    for part in parts:
-        if re.search(r'[a-zA-Z]', part) and re.search(r'\d', part):
-            cleaned = part.replace('"', '').replace("'", '').replace(' ', '')
-            if cleaned in sku_set: return cleaned, True
-
-    # 5. 最长部分回退
-    if cleaned_parts:
-        longest = max(cleaned_parts, key=len)
-        return longest, False
-
     return '', False
 
 def process_inventory(inventory_file, product_file):
-    """主处理函数"""
-    
-    # 1. 加载产品资料
+    # 1. 加载资料
     sku_set, sku_to_name = load_product_reference_from_obj(product_file)
     if product_file:
-        st.info(f"已加载产品资料：包含 {len(sku_set)} 个SKU，{len(sku_to_name)} 个品名映射")
-    else:
-        st.warning("未上传产品资料表，将使用简易模式提取SKU且无法自动填充品名。")
+        st.info(f"📚 已加载产品资料：{len(sku_set)} 个SKU")
 
     # 2. 加载主文件
     wb = openpyxl.load_workbook(inventory_file)
     sheets = wb.sheetnames
     
-    # 查找 Sheet
-    inventory_sheet_name = sheets[1] if len(sheets) > 1 else None
-    sz_stock_sheet_name = find_sheet_name(sheets, ['深圳仓', '深圳', '仓库'])
-    wfs_stock_sheet_name = find_sheet_name(sheets, ['WFS库存', 'WFS'])
-    sales_sheet_name = sheets[4] if len(sheets) > 4 else None
-    po_sheet_name = find_sheet_name(sheets, ['采购订单', '采购', '在途'])
-
-    if not all([inventory_sheet_name, wfs_stock_sheet_name, sales_sheet_name]):
-        st.error("无法识别必要的Sheet，请检查文件格式（需包含WFS库存、销量明细、库存明细表）。")
+    # Sheet 查找逻辑
+    def find_sheet(keywords):
+        for s in sheets:
+            if any(k in s for k in keywords): return s
         return None
 
-    # === 第0步：记录原有记录 (历史保护) ===
-    inventory_sheet = wb[inventory_sheet_name]
-    existing_keys = set()
-    
-    # 扫描确定原有记录范围
-    original_max_row = inventory_sheet.max_row
-    st.write(f"原有记录保护范围：前 {original_max_row} 行 (含表头)")
-    
-    # 预加载现有Key以避免重复
-    for r in range(3, original_max_row + 1):
-        s_val = inventory_sheet.cell(r, 1).value
-        m_val = inventory_sheet.cell(r, 2).value
-        store = str(s_val).strip() if s_val else ''
-        msku = str(m_val).strip() if m_val else ''
-        if store or msku:
-            existing_keys.add(f"{store}{msku}")
+    inventory_sheet_name = sheets[1] if len(sheets) > 1 else None
+    sz_stock_sheet_name = find_sheet(['深圳仓', '深圳', '仓库'])
+    wfs_stock_sheet_name = find_sheet(['WFS库存', 'WFS'])
+    sales_sheet_name = sheets[4] if len(sheets) > 4 else None
+    po_sheet_name = find_sheet(['采购订单', '采购', '在途'])
 
-    # === 第1步：处理 WFS 库存 ===
+    if not all([inventory_sheet_name, wfs_stock_sheet_name, sales_sheet_name]):
+        st.error("❌ 无法识别必要的Sheet。请确保文件包含：第2个Sheet为库存表，第5个为销量表，以及名为'WFS...'的Sheet。")
+        return None
+
+    # === 第0步：保护原有记录 ===
+    inventory_sheet = wb[inventory_sheet_name]
+    original_max_row = inventory_sheet.max_row
+    st.write(f"🛡️ 原有记录保护范围：前 {original_max_row} 行")
+    
+    existing_keys = set()
+    for r in range(3, original_max_row + 1):
+        s = str(inventory_sheet.cell(r, 1).value or '').strip()
+        m = str(inventory_sheet.cell(r, 2).value or '').strip()
+        if s or m: existing_keys.add(f"{s}{m}")
+
+    # === 第1步：WFS 库存 (增强匹配) ===
     wfs_sheet = wb[wfs_stock_sheet_name]
     wfs_dict = {}
     
-    # 动态映射列 (严格匹配逻辑修正)
-    wfs_header = [c.value for c in wfs_sheet[1]]
-    wfs_map = {}
-    for idx, col_name in enumerate(wfs_header, 1):
-        if not col_name: continue
-        c = str(col_name).strip()
-        if '仓库' in c: wfs_map['仓库'] = idx
-        elif 'msku' in c: wfs_map['msku'] = idx
-        elif c == 'GTIN码': wfs_map['GTIN码'] = idx
-        elif '平台' in c and '商品' in c and 'ID' in c: wfs_map['平台商品ID'] = idx # 严格区分ID
-        elif '品名' in c and 'ID' not in c: wfs_map['品名'] = idx
-        elif 'sku' == c: wfs_map['sku'] = idx
-        elif '商品状态' in c: wfs_map['商品状态'] = idx
-        # 严格匹配数值列，必须包含"数量"
-        elif 'WFS可售' in c and '新' in c and '数量' in c: wfs_map['可售'] = idx
-        elif '无法入库' in c and '数量' in c: wfs_map['无法入库'] = idx
-        elif '标发在途' in c and '数量' in c: wfs_map['标发'] = idx 
+    # 智能查找列 - 排除ID列，优先找带'数量'的列
+    w_wh = find_col_index_smart(wfs_sheet, ['仓库']) or 1
+    w_msku = find_col_index_smart(wfs_sheet, ['msku']) or 2
+    w_gtin = find_col_index_smart(wfs_sheet, ['gtin'])
+    w_sku = find_col_index_smart(wfs_sheet, ['sku'])
+    w_name = find_col_index_smart(wfs_sheet, ['品名'], keywords_exclude=['id'])
+    w_status = find_col_index_smart(wfs_sheet, ['商品状态'])
     
-    if '标发' not in wfs_map:
-        st.warning("⚠️ 警告：在WFS库存表中未找到'标发在途'且包含'数量'的列，相关数据可能为0。")
+    # 关键数值列 (排除ID)
+    w_avail = find_col_index_smart(wfs_sheet, ['wfs', '可售', '新'], keywords_exclude=['id', 'code'])
+    w_unable = find_col_index_smart(wfs_sheet, ['无法', '入库'], keywords_exclude=['id', 'code'])
+    w_transit = find_col_index_smart(wfs_sheet, ['标发', '在途'], keywords_exclude=['id', 'code', '货件'])
+    
+    # 调试信息：显示找到的列名
+    if w_transit:
+        col_name = wfs_sheet.cell(1, w_transit).value
+        st.write(f"✅ WFS '标发在途' 匹配到列: {col_name} (第{w_transit}列)")
+    else:
+        st.warning("⚠️ 未找到 WFS '标发在途' 列，该项数据将为 0")
 
     for row in range(2, wfs_sheet.max_row + 1):
-        wh = str(wfs_sheet.cell(row, wfs_map.get('仓库', 1)).value or '').strip()
-        msku = str(wfs_sheet.cell(row, wfs_map.get('msku', 2)).value or '').strip()
+        wh = str(wfs_sheet.cell(row, w_wh).value or '').strip()
+        msku = str(wfs_sheet.cell(row, w_msku).value or '').strip()
         if wh and msku:
             key = f"{wh}{msku}"
             wfs_dict[key] = {
                 '仓库': wh, 'msku': msku,
-                'GTIN码': str(wfs_sheet.cell(row, wfs_map.get('GTIN码', 10)).value or ''),
-                '品名': wfs_sheet.cell(row, wfs_map.get('品名', 12)).value,
-                'sku': wfs_sheet.cell(row, wfs_map.get('sku', 13)).value,
-                '商品状态': wfs_sheet.cell(row, wfs_map.get('商品状态', 14)).value,
-                # 使用安全获取，如果没有映射到列则默认为0
-                '可售': get_numeric_value(wfs_sheet.cell(row, wfs_map.get('可售', 999))) if '可售' in wfs_map else 0,
-                '无法入库': get_numeric_value(wfs_sheet.cell(row, wfs_map.get('无法入库', 999))) if '无法入库' in wfs_map else 0,
-                '标发': get_numeric_value(wfs_sheet.cell(row, wfs_map.get('标发', 999))) if '标发' in wfs_map else 0
+                'GTIN码': str(wfs_sheet.cell(row, w_gtin).value or '') if w_gtin else '',
+                'sku': wfs_sheet.cell(row, w_sku).value if w_sku else '',
+                '品名': wfs_sheet.cell(row, w_name).value if w_name else '',
+                '商品状态': wfs_sheet.cell(row, w_status).value if w_status else '',
+                # 数值获取
+                'WFS可售': get_numeric_value(wfs_sheet.cell(row, w_avail)) if w_avail else 0,
+                '无法入库': get_numeric_value(wfs_sheet.cell(row, w_unable)) if w_unable else 0,
+                '标发在途': get_numeric_value(wfs_sheet.cell(row, w_transit)) if w_transit else 0
             }
 
-    # === 第2步：处理销量明细 (v11: 精确店铺匹配) ===
+    # === 第2步：销量明细 (精准列名匹配) ===
     sales_sheet = wb[sales_sheet_name]
     sales_dict = {}
-    sales_header = [c.value for c in sales_sheet[1]]
-    sales_map = {}
-    for idx, col_name in enumerate(sales_header, 1):
-        if not col_name: continue
-        c = str(col_name).strip()
-        if c == 'MSKU': sales_map['MSKU'] = idx
-        elif c == 'SKU': sales_map['SKU'] = idx
-        elif c == '店铺': sales_map['店铺'] = idx
-        elif c == '品名': sales_map['品名'] = idx
-        elif c == '小计': sales_map['小计'] = idx
+    
+    s_msku = find_col_index_smart(sales_sheet, ['msku'])
+    s_store = find_col_index_smart(sales_sheet, ['店铺'])
+    s_subtotal = find_col_index_smart(sales_sheet, ['小计']) or find_col_index_smart(sales_sheet, ['sales'])
+    s_sku = find_col_index_smart(sales_sheet, ['sku'])
+    s_name = find_col_index_smart(sales_sheet, ['品名'])
+
+    if s_subtotal:
+        st.write(f"✅ 销量 '小计' 匹配到列: {sales_sheet.cell(1, s_subtotal).value}")
 
     for row in range(2, sales_sheet.max_row + 1):
-        msku = str(sales_sheet.cell(row, sales_map.get('MSKU', 4)).value or '').strip()
-        store = str(sales_sheet.cell(row, sales_map.get('店铺', 3)).value or '').strip()
+        msku = str(sales_sheet.cell(row, s_msku).value or '').strip() if s_msku else ''
+        store = str(sales_sheet.cell(row, s_store).value or '').strip() if s_store else ''
         
         if not store and '-' in msku: store = msku.split('-')[0]
              
         if msku:
             key = f"{store}{msku}"
-            sku_val = str(sales_sheet.cell(row, sales_map.get('SKU', 6)).value or '').strip()
+            sku_val = str(sales_sheet.cell(row, s_sku).value or '').strip() if s_sku else ''
             if not sku_val: sku_val, _ = extract_sku_smart(msku, sku_set)
                 
             sales_dict[key] = {
                 '店铺': store, 'msku': msku,
-                '销量': get_numeric_value(sales_sheet.cell(row, sales_map.get('小计', 13))),
+                '销量': get_numeric_value(sales_sheet.cell(row, s_subtotal)) if s_subtotal else 0,
                 'SKU': sku_val,
-                '品名': sales_sheet.cell(row, sales_map.get('品名', 7)).value
+                '品名': sales_sheet.cell(row, s_name).value if s_name else ''
             }
 
-    # === 第3步 & 4步：深圳仓 & 采购在途 ===
+    # === 第3 & 4步：深圳仓 & 采购 ===
     sz_stock_dict = {}
     if sz_stock_sheet_name:
         sz_sheet = wb[sz_stock_sheet_name]
-        sz_qty_col = 10 
-        for col in range(1, 20):
-            val = str(sz_sheet.cell(1, col).value or '')
-            if '可用' in val: sz_qty_col = col; break
-        
+        sz_sku = find_col_index_smart(sz_sheet, ['sku']) or 1
+        sz_qty = find_col_index_smart(sz_sheet, ['可用']) or find_col_index_smart(sz_sheet, ['实际', '可用']) or 10
         for row in range(2, sz_sheet.max_row + 1):
-            sku = str(sz_sheet.cell(row, 1).value or '').strip()
+            sku = str(sz_sheet.cell(row, sz_sku).value or '').strip()
             if sku:
-                qty = get_numeric_value(sz_sheet.cell(row, sz_qty_col))
+                qty = get_numeric_value(sz_sheet.cell(row, sz_qty))
                 sz_stock_dict[sku] = sz_stock_dict.get(sku, 0) + qty
 
     po_dict = {}
     if po_sheet_name:
         po_sheet = wb[po_sheet_name]
-        po_sku_col = 7; po_qty_col = 19
-        for col in range(1, 40):
-            val = str(po_sheet.cell(1, col).value or '')
-            if 'SKU' == val.upper(): po_sku_col = col
-            if '未入库' in val: po_qty_col = col
-            
+        po_sku = find_col_index_smart(po_sheet, ['sku']) or 7
+        po_qty = find_col_index_smart(po_sheet, ['未入库']) or 19
         for row in range(2, po_sheet.max_row + 1):
-            sku = str(po_sheet.cell(row, po_sku_col).value or '').strip()
+            sku = str(po_sheet.cell(row, po_sku).value or '').strip()
             if sku:
-                qty = get_numeric_value(po_sheet.cell(row, po_qty_col))
+                qty = get_numeric_value(po_sheet.cell(row, po_qty))
                 po_dict[sku] = po_dict.get(sku, 0) + qty
 
-    # === 第5步：更新与新增 ===
+    # === 第5步：更新与新增 (目标表映射) ===
     inv_header_row = 2
-    inv_map = {}
-    for col in range(1, 100):
-        val = inventory_sheet.cell(inv_header_row, col).value
-        if val:
-            c = str(val).strip()
-            if c == '店铺': inv_map['店铺'] = col
-            elif c == 'msku': inv_map['msku'] = col
-            elif c == '店铺&MSKU': inv_map['店铺&MSKU'] = col
-            elif c == 'GTIN码': inv_map['GTIN'] = col
-            elif c == '品名': inv_map['品名'] = col
-            elif c == 'sku': inv_map['sku'] = col
-            elif c == '商品状态': inv_map['状态'] = col
-            # 同样严格匹配目标表列名
-            elif 'WFS可售' in c and '数量' in c: inv_map['WFS可售'] = col
-            elif '无法入库' in c and '数量' in c: inv_map['无法入库'] = col
-            elif '标发' in c and '数量' in c: inv_map['标发'] = col
-            elif '深圳仓' in c: inv_map['深圳仓'] = col
-            elif '采购' in c: inv_map['采购'] = col
-            elif '总库存' in c: inv_map['总库存'] = col
-            elif '总周转' in c: inv_map['总周转'] = col
-            elif c == sales_sheet_name: inv_map['销量'] = col
+    # 目标表映射：严格匹配列名
+    i_store = find_col_index_smart(inventory_sheet, ['店铺'], keywords_exclude=['msku'], header_row=2)
+    i_msku = find_col_index_smart(inventory_sheet, ['msku'], keywords_exclude=['店铺'], header_row=2)
+    i_store_msku = find_col_index_smart(inventory_sheet, ['店铺', 'msku'], header_row=2)
+    i_gtin = find_col_index_smart(inventory_sheet, ['gtin'], header_row=2)
+    i_name = find_col_index_smart(inventory_sheet, ['品名'], header_row=2)
+    i_sku = find_col_index_smart(inventory_sheet, ['sku'], header_row=2)
+    i_status = find_col_index_smart(inventory_sheet, ['状态'], header_row=2)
     
-    if '销量' not in inv_map:
-        new_col = inventory_sheet.max_column + 1
-        inventory_sheet.cell(inv_header_row, new_col, value=sales_sheet_name)
-        inv_map['销量'] = new_col
+    # 关键目标数值列
+    i_avail = find_col_index_smart(inventory_sheet, ['wfs', '可售', '新'], header_row=2)
+    i_unable = find_col_index_smart(inventory_sheet, ['无法', '入库'], header_row=2)
+    i_transit = find_col_index_smart(inventory_sheet, ['标发'], header_row=2)
+    i_sz = find_col_index_smart(inventory_sheet, ['深圳仓'], header_row=2)
+    i_po = find_col_index_smart(inventory_sheet, ['采购'], header_row=2)
+    i_total = find_col_index_smart(inventory_sheet, ['总库存'], header_row=2)
+    i_turnover = find_col_index_smart(inventory_sheet, ['总周转'], header_row=2)
+    
+    # 销量列 (动态)
+    i_sales = find_col_index_smart(inventory_sheet, [clean_header(sales_sheet_name)], header_row=2)
+    if not i_sales:
+        i_sales = inventory_sheet.max_column + 1
+        inventory_sheet.cell(row=2, column=i_sales, value=sales_sheet_name)
+        st.write(f"➕ 新增销量列: {sales_sheet_name}")
 
-    # 5.1 更新现有记录
+    # --- 5.1 更新现有 ---
     for r in range(3, original_max_row + 1):
-        s_val = str(inventory_sheet.cell(r, inv_map.get('店铺', 1)).value or '').strip()
-        m_val = str(inventory_sheet.cell(r, inv_map.get('msku', 2)).value or '').strip()
-        sku_val = str(inventory_sheet.cell(r, inv_map.get('sku', 8)).value or '').strip()
+        s = str(inventory_sheet.cell(r, i_store).value or '').strip() if i_store else ''
+        m = str(inventory_sheet.cell(r, i_msku).value or '').strip() if i_msku else ''
+        if not s and not m: continue
+        key = f"{s}{m}"
         
-        if not s_val and not m_val: continue
+        # 尝试获取当前行的SKU用于备用匹配
+        curr_sku = str(inventory_sheet.cell(r, i_sku).value or '').strip() if i_sku else ''
 
-        key = f"{s_val}{m_val}"
-        
         if key in wfs_dict:
             d = wfs_dict[key]
-            if 'GTIN' in inv_map: inventory_sheet.cell(r, inv_map['GTIN'], d['GTIN码'])
-            if '品名' in inv_map and d['品名']: inventory_sheet.cell(r, inv_map['品名'], d['品名'])
-            if 'sku' in inv_map and d['sku']: inventory_sheet.cell(r, inv_map['sku'], d['sku'])
-            if '状态' in inv_map: inventory_sheet.cell(r, inv_map['状态'], d['商品状态'])
-            if 'WFS可售' in inv_map: inventory_sheet.cell(r, inv_map['WFS可售'], d['可售'])
-            if '无法入库' in inv_map: inventory_sheet.cell(r, inv_map['无法入库'], d['无法入库'])
-            if '标发' in inv_map: inventory_sheet.cell(r, inv_map['标发'], d['标发'])
-            if d['sku']: sku_val = str(d['sku']).strip()
-        
+            if i_gtin: inventory_sheet.cell(r, i_gtin, d['GTIN码'])
+            if i_name and d['品名']: inventory_sheet.cell(r, i_name, d['品名'])
+            if i_sku and d['sku']: 
+                inventory_sheet.cell(r, i_sku, d['sku'])
+                curr_sku = d['sku']
+            if i_status: inventory_sheet.cell(r, i_status, d['商品状态'])
+            if i_avail: inventory_sheet.cell(r, i_avail, d['WFS可售'])
+            if i_unable: inventory_sheet.cell(r, i_unable, d['无法入库'])
+            if i_transit: inventory_sheet.cell(r, i_transit, d['标发在途'])
+            
         if key in sales_dict:
-            inventory_sheet.cell(r, inv_map['销量'], sales_dict[key]['销量'])
-        
-        if sku_val:
-            if sku_val in sz_stock_dict and '深圳仓' in inv_map:
-                inventory_sheet.cell(r, inv_map['深圳仓'], sz_stock_dict[sku_val])
-            if sku_val in po_dict and '采购' in inv_map:
-                inventory_sheet.cell(r, inv_map['采购'], po_dict[sku_val])
+            if i_sales: inventory_sheet.cell(r, i_sales, sales_dict[key]['销量'])
+            
+        if curr_sku:
+            if curr_sku in sz_stock_dict and i_sz: inventory_sheet.cell(r, i_sz, sz_stock_dict[curr_sku])
+            if curr_sku in po_dict and i_po: inventory_sheet.cell(r, i_po, po_dict[curr_sku])
 
-    # 5.2 添加新记录
+    # --- 5.2 添加新行 ---
     all_keys = set(wfs_dict.keys()) | set(sales_dict.keys())
     new_rows_data = []
     
     for key in all_keys:
         if key in existing_keys: continue
         
-        row_data = {
+        # 基础数据结构
+        d = {
             '店铺': '', 'msku': '', '店铺&MSKU': key, 'sku': '', '品名': '',
-            'WFS可售': 0, '无法入库': 0, '标发': 0, '销量': 0
+            'WFS可售': 0, '无法入库': 0, '标发在途': 0, '销量': 0
         }
         
+        # 优先取WFS数据
         if key in wfs_dict:
             src = wfs_dict[key]
-            row_data.update({
-                '店铺': src['仓库'], 'msku': src['msku'],
-                'GTIN': src['GTIN码'], '品名': src['品名'],
-                'sku': src['sku'], '状态': src['商品状态'],
-                'WFS可售': src['可售'], '无法入库': src['无法入库'], '标发': src['标发']
-            })
-        elif key in sales_dict:
+            d.update(src) # 覆盖 WFS可售, 无法入库, 标发在途, sku, 品名 等
+            d['店铺'] = src['仓库']
+            d['msku'] = src['msku']
+        
+        # 补全销量数据
+        if key in sales_dict:
             src = sales_dict[key]
-            row_data.update({
-                '店铺': src['店铺'], 'msku': src['msku'],
-                '销量': src['销量'], 'sku': src['SKU'], '品名': src['品名']
-            })
+            d['销量'] = src['销量']
+            if not d['店铺']: d['店铺'] = src['店铺']
+            if not d['msku']: d['msku'] = src['msku']
+            if not d['sku']: d['sku'] = src['SKU']
+            if not d['品名']: d['品名'] = src['品名']
+
+        # SKU补全
+        if not d['sku']:
+            extracted, _ = extract_sku_smart(d['msku'], sku_set)
+            if extracted: d['sku'] = extracted
             
-        current_sku = str(row_data.get('sku', '') or '').strip()
-        if not current_sku:
-            extracted_sku, found = extract_sku_smart(row_data['msku'], sku_set)
-            if extracted_sku:
-                current_sku = extracted_sku
-                row_data['sku'] = current_sku
-        
-        if not row_data.get('品名') and current_sku in sku_to_name:
-            row_data['品名'] = sku_to_name[current_sku]
+        # 品名补全
+        if not d['品名'] and d['sku'] in sku_to_name:
+            d['品名'] = sku_to_name[d['sku']]
 
-        new_rows_data.append(row_data)
+        new_rows_data.append(d)
 
-    current_row = original_max_row + 1
-    
+    # --- 写入新行 ---
+    curr_row = original_max_row + 1
     for data in new_rows_data:
-        if '店铺' in inv_map: inventory_sheet.cell(current_row, inv_map['店铺'], data['店铺'])
-        if 'msku' in inv_map: inventory_sheet.cell(current_row, inv_map['msku'], data['msku'])
-        if '店铺&MSKU' in inv_map: inventory_sheet.cell(current_row, inv_map['店铺&MSKU'], data['店铺&MSKU'])
-        if 'GTIN' in inv_map and 'GTIN' in data: inventory_sheet.cell(current_row, inv_map['GTIN'], data['GTIN'])
-        if 'sku' in inv_map: inventory_sheet.cell(current_row, inv_map['sku'], data['sku'])
-        if '品名' in inv_map: inventory_sheet.cell(current_row, inv_map['品名'], data['品名'])
-        if '状态' in inv_map and '状态' in data: inventory_sheet.cell(current_row, inv_map['状态'], data['状态'])
+        if i_store: inventory_sheet.cell(curr_row, i_store, data['店铺'])
+        if i_msku: inventory_sheet.cell(curr_row, i_msku, data['msku'])
+        if i_store_msku: inventory_sheet.cell(curr_row, i_store_msku, data['店铺&MSKU'])
+        if i_gtin and 'GTIN码' in data: inventory_sheet.cell(curr_row, i_gtin, data['GTIN码'])
+        if i_sku: inventory_sheet.cell(curr_row, i_sku, data['sku'])
+        if i_name: inventory_sheet.cell(curr_row, i_name, data['品名'])
+        if i_status and '商品状态' in data: inventory_sheet.cell(curr_row, i_status, data['商品状态'])
         
-        if 'WFS可售' in inv_map: inventory_sheet.cell(current_row, inv_map['WFS可售'], data['WFS可售'])
-        if '无法入库' in inv_map: inventory_sheet.cell(current_row, inv_map['无法入库'], data['无法入库'])
-        if '标发' in inv_map: inventory_sheet.cell(current_row, inv_map['标发'], data['标发'])
-        if '销量' in inv_map: inventory_sheet.cell(current_row, inv_map['销量'], data['销量'])
+        # 写入关键数值
+        if i_avail: inventory_sheet.cell(curr_row, i_avail, data['WFS可售'])
+        if i_unable: inventory_sheet.cell(curr_row, i_unable, data['无法入库'])
+        if i_transit: inventory_sheet.cell(curr_row, i_transit, data['标发在途'])
+        if i_sales: inventory_sheet.cell(curr_row, i_sales, data['销量'])
         
-        sku = str(data.get('sku', '')).strip()
+        # 深圳仓 & 采购
+        sku = data['sku']
         if sku:
-            if sku in sz_stock_dict and '深圳仓' in inv_map:
-                inventory_sheet.cell(current_row, inv_map['深圳仓'], sz_stock_dict[sku])
-            if sku in po_dict and '采购' in inv_map:
-                inventory_sheet.cell(current_row, inv_map['采购'], po_dict[sku])
-                
-        current_row += 1
-
-    # === 第6步：计算公式 & 清理 ===
-    for r in range(3, current_row):
-        wfs = get_numeric_value(inventory_sheet.cell(r, inv_map.get('WFS可售')))
-        unable = get_numeric_value(inventory_sheet.cell(r, inv_map.get('无法入库')))
-        transit = get_numeric_value(inventory_sheet.cell(r, inv_map.get('标发')))
-        sz = get_numeric_value(inventory_sheet.cell(r, inv_map.get('深圳仓')))
-        sales = get_numeric_value(inventory_sheet.cell(r, inv_map.get('销量')))
-        
-        total = wfs + unable + transit + sz
-        if '总库存' in inv_map:
-            inventory_sheet.cell(r, inv_map['总库存'], total)
+            if i_sz and sku in sz_stock_dict: inventory_sheet.cell(curr_row, i_sz, sz_stock_dict[sku])
+            if i_po and sku in po_dict: inventory_sheet.cell(curr_row, i_po, po_dict[sku])
             
-        if '总周转' in inv_map:
-            if sales > 0:
-                turnover = round((wfs + transit + sz) / sales * 30, 2)
-                inventory_sheet.cell(r, inv_map['总周转'], turnover)
+        curr_row += 1
+
+    # === 第6步：计算与清理 ===
+    # 6.1 计算公式
+    for r in range(3, curr_row):
+        v_wfs = get_numeric_value(inventory_sheet.cell(r, i_avail)) if i_avail else 0
+        v_unable = get_numeric_value(inventory_sheet.cell(r, i_unable)) if i_unable else 0
+        v_transit = get_numeric_value(inventory_sheet.cell(r, i_transit)) if i_transit else 0
+        v_sz = get_numeric_value(inventory_sheet.cell(r, i_sz)) if i_sz else 0
+        v_sales = get_numeric_value(inventory_sheet.cell(r, i_sales)) if i_sales else 0
+        
+        total = v_wfs + v_unable + v_transit + v_sz
+        if i_total: inventory_sheet.cell(r, i_total, total)
+        
+        if i_turnover:
+            if v_sales > 0:
+                turnover = round((v_wfs + v_transit + v_sz) / v_sales * 30, 2)
+                inventory_sheet.cell(r, i_turnover, turnover)
             else:
-                inventory_sheet.cell(r, inv_map['总周转'], "")
+                inventory_sheet.cell(r, i_turnover, "")
 
-    rows_to_delete = []
-    for r in range(original_max_row + 1, current_row):
-        is_zero = True
-        vals = [
-            get_numeric_value(inventory_sheet.cell(r, inv_map.get('WFS可售'))),
-            get_numeric_value(inventory_sheet.cell(r, inv_map.get('无法入库'))),
-            get_numeric_value(inventory_sheet.cell(r, inv_map.get('标发'))),
-            get_numeric_value(inventory_sheet.cell(r, inv_map.get('深圳仓'))),
-            get_numeric_value(inventory_sheet.cell(r, inv_map.get('采购'))),
-            get_numeric_value(inventory_sheet.cell(r, inv_map.get('销量')))
-        ]
-        if any(v != 0 for v in vals): is_zero = False
-            
-        store_val = str(inventory_sheet.cell(r, inv_map.get('店铺', 1)).value or '').strip()
+    # 6.2 严格删除逻辑 (只针对新增行)
+    # 规则：WFS匹配的三个数量 + 销量表匹配的数量 均为0/空
+    rows_to_del = []
+    for r in range(original_max_row + 1, curr_row):
+        # 检查 WFS 来源的数值
+        val_wfs = get_numeric_value(inventory_sheet.cell(r, i_avail)) if i_avail else 0
+        val_unable = get_numeric_value(inventory_sheet.cell(r, i_unable)) if i_unable else 0
+        val_transit = get_numeric_value(inventory_sheet.cell(r, i_transit)) if i_transit else 0
+        # 检查 销量
+        val_sales = get_numeric_value(inventory_sheet.cell(r, i_sales)) if i_sales else 0
         
-        if is_zero and not store_val: rows_to_delete.append(r)
-        elif is_zero: rows_to_delete.append(r)
+        # 如果这4个关键值都为0，则删除
+        if (val_wfs == 0 and val_unable == 0 and val_transit == 0 and val_sales == 0):
+            rows_to_del.append(r)
 
-    for r in sorted(rows_to_delete, reverse=True):
+    for r in sorted(rows_to_del, reverse=True):
         inventory_sheet.delete_rows(r, 1)
 
-    st.success(f"处理完成！原有记录 {original_max_row} 行，新增记录 {len(new_rows_data) - len(rows_to_delete)} 条。")
+    st.success(f"✅ 处理完成！原有 {original_max_row} 行，新增 {len(new_rows_data) - len(rows_to_del)} 条有效记录 (已自动过滤无数据行)。")
     
-    output = io.BytesIO()
-    wb.save(output)
-    output.seek(0)
-    return output
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out
 
-# ==========================================
-# Streamlit UI
-# ==========================================
-
-st.set_page_config(page_title="沃尔玛库存更新工具 v11", layout="wide")
-
-st.title("🛒 沃尔玛呆滞库存更新工具 (v11 修复版)")
+# UI 部分
+st.set_page_config(page_title="沃尔玛库存工具 v12", layout="wide")
+st.title("🛒 沃尔玛库存更新工具 (v12 深度修复版)")
 st.markdown("""
-**功能说明：**
-1. 自动合并 WFS库存、销量明细、深圳仓库存、采购在途数据。
-2. **修复说明**：严格匹配“标发在途”与“数量”列，防止误读取 ID 或其他无关列。
-3. **隐私安全**：数据仅在内存中处理，刷新页面即销毁。
+**本次更新重点 (v12)：**
+1. **智能列名匹配**：兼容 `标发在途(数量)`、`标发在途`、`In Transit` 等多种表头写法，并排除 `ID/代码` 列。
+2. **数据补全**：强制抓取 `WFS可售`、`无法入库`、`标发在途` 和 `销量小计`。
+3. **严格过滤**：新增记录中，如果上述 4 个关键数值均为 0，将自动删除该行。
 """)
 
-col1, col2 = st.columns(2)
+c1, c2 = st.columns(2)
+with c1:
+    f_inv = st.file_uploader("上传库存明细表 (必选)", type=['xlsx'], key="inv")
+with c2:
+    f_prod = st.file_uploader("上传产品资料表 (推荐)", type=['xlsx'], key="prod")
 
-with col1:
-    st.subheader("1. 上传库存数据表 (必选)")
-    inventory_file = st.file_uploader("上传 .xlsx 文件", type=['xlsx'], key="inv")
-
-with col2:
-    st.subheader("2. 上传产品资料表 (推荐)")
-    st.markdown("用于智能匹配 SKU 和自动填充品名")
-    product_file = st.file_uploader("上传 .xlsx 文件", type=['xlsx'], key="prod")
-
-if inventory_file:
-    if st.button("🚀 开始处理", type="primary"):
-        with st.spinner("正在分析数据，请稍候..."):
-            try:
-                processed_data = process_inventory(inventory_file, product_file)
-                
-                if processed_data:
-                    st.success("✅ 处理成功！请点击下方按钮下载。")
-                    st.download_button(
-                        label="📥 下载更新后的库存表",
-                        data=processed_data,
-                        file_name=f"updated_{inventory_file.name}",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-            except Exception as e:
-                st.error(f"处理过程中发生错误: {str(e)}")
-                st.exception(e)
+if f_inv and st.button("🚀 开始处理"):
+    try:
+        data = process_inventory(f_inv, f_prod)
+        if data:
+            st.download_button("📥 下载结果", data, f"Updated_{f_inv.name}")
+    except Exception as e:
+        st.error(f"发生错误: {e}")
