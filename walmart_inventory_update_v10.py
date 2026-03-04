@@ -9,7 +9,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ==========================================
-# 核心逻辑函数 (基于 v11 优化)
+# 核心逻辑函数 (基于 v11 修复版)
 # ==========================================
 
 def find_sheet_name(sheets, keywords):
@@ -75,7 +75,6 @@ def load_product_reference_from_obj(product_file_obj):
         if sku_col_idx:
             row_idx = 2
             while True:
-                # 安全读取
                 try:
                     sku_cell = ws.cell(row=row_idx, column=sku_col_idx)
                     if not sku_cell: break
@@ -173,7 +172,7 @@ def process_inventory(inventory_file, product_file):
     inventory_sheet = wb[inventory_sheet_name]
     existing_keys = set()
     
-    # 扫描确定原有记录范围 (使用 max_row 更安全)
+    # 扫描确定原有记录范围
     original_max_row = inventory_sheet.max_row
     st.write(f"原有记录保护范围：前 {original_max_row} 行 (含表头)")
     
@@ -190,7 +189,7 @@ def process_inventory(inventory_file, product_file):
     wfs_sheet = wb[wfs_stock_sheet_name]
     wfs_dict = {}
     
-    # 动态映射列
+    # 动态映射列 (严格匹配逻辑修正)
     wfs_header = [c.value for c in wfs_sheet[1]]
     wfs_map = {}
     for idx, col_name in enumerate(wfs_header, 1):
@@ -198,14 +197,19 @@ def process_inventory(inventory_file, product_file):
         c = str(col_name).strip()
         if '仓库' in c: wfs_map['仓库'] = idx
         elif 'msku' in c: wfs_map['msku'] = idx
-        elif 'GTIN码' == c: wfs_map['GTIN码'] = idx
+        elif c == 'GTIN码': wfs_map['GTIN码'] = idx
+        elif '平台' in c and '商品' in c and 'ID' in c: wfs_map['平台商品ID'] = idx # 严格区分ID
         elif '品名' in c and 'ID' not in c: wfs_map['品名'] = idx
         elif 'sku' == c: wfs_map['sku'] = idx
         elif '商品状态' in c: wfs_map['商品状态'] = idx
-        elif 'WFS可售' in c and '新' in c: wfs_map['可售'] = idx
-        elif '无法入库' in c: wfs_map['无法入库'] = idx
-        elif '标发在途' in c: wfs_map['标发'] = idx
+        # 严格匹配数值列，必须包含"数量"
+        elif 'WFS可售' in c and '新' in c and '数量' in c: wfs_map['可售'] = idx
+        elif '无法入库' in c and '数量' in c: wfs_map['无法入库'] = idx
+        elif '标发在途' in c and '数量' in c: wfs_map['标发'] = idx 
     
+    if '标发' not in wfs_map:
+        st.warning("⚠️ 警告：在WFS库存表中未找到'标发在途'且包含'数量'的列，相关数据可能为0。")
+
     for row in range(2, wfs_sheet.max_row + 1):
         wh = str(wfs_sheet.cell(row, wfs_map.get('仓库', 1)).value or '').strip()
         msku = str(wfs_sheet.cell(row, wfs_map.get('msku', 2)).value or '').strip()
@@ -217,9 +221,10 @@ def process_inventory(inventory_file, product_file):
                 '品名': wfs_sheet.cell(row, wfs_map.get('品名', 12)).value,
                 'sku': wfs_sheet.cell(row, wfs_map.get('sku', 13)).value,
                 '商品状态': wfs_sheet.cell(row, wfs_map.get('商品状态', 14)).value,
-                '可售': get_numeric_value(wfs_sheet.cell(row, wfs_map.get('可售', 18))),
-                '无法入库': get_numeric_value(wfs_sheet.cell(row, wfs_map.get('无法入库', 19))),
-                '标发': get_numeric_value(wfs_sheet.cell(row, wfs_map.get('标发', 20)))
+                # 使用安全获取，如果没有映射到列则默认为0
+                '可售': get_numeric_value(wfs_sheet.cell(row, wfs_map.get('可售', 999))) if '可售' in wfs_map else 0,
+                '无法入库': get_numeric_value(wfs_sheet.cell(row, wfs_map.get('无法入库', 999))) if '无法入库' in wfs_map else 0,
+                '标发': get_numeric_value(wfs_sheet.cell(row, wfs_map.get('标发', 999))) if '标发' in wfs_map else 0
             }
 
     # === 第2步：处理销量明细 (v11: 精确店铺匹配) ===
@@ -298,9 +303,10 @@ def process_inventory(inventory_file, product_file):
             elif c == '品名': inv_map['品名'] = col
             elif c == 'sku': inv_map['sku'] = col
             elif c == '商品状态': inv_map['状态'] = col
-            elif 'WFS可售' in c: inv_map['WFS可售'] = col
-            elif '无法入库' in c: inv_map['无法入库'] = col
-            elif '标发' in c: inv_map['标发'] = col
+            # 同样严格匹配目标表列名
+            elif 'WFS可售' in c and '数量' in c: inv_map['WFS可售'] = col
+            elif '无法入库' in c and '数量' in c: inv_map['无法入库'] = col
+            elif '标发' in c and '数量' in c: inv_map['标发'] = col
             elif '深圳仓' in c: inv_map['深圳仓'] = col
             elif '采购' in c: inv_map['采购'] = col
             elif '总库存' in c: inv_map['总库存'] = col
@@ -459,11 +465,11 @@ def process_inventory(inventory_file, product_file):
 
 st.set_page_config(page_title="沃尔玛库存更新工具 v11", layout="wide")
 
-st.title("🛒 沃尔玛呆滞库存更新工具 (v11 在线版)")
+st.title("🛒 沃尔玛呆滞库存更新工具 (v11 修复版)")
 st.markdown("""
 **功能说明：**
 1. 自动合并 WFS库存、销量明细、深圳仓库存、采购在途数据。
-2. **v11 升级**：严格保护历史记录，智能匹配品名，精确销量匹配。
+2. **修复说明**：严格匹配“标发在途”与“数量”列，防止误读取 ID 或其他无关列。
 3. **隐私安全**：数据仅在内存中处理，刷新页面即销毁。
 """)
 
