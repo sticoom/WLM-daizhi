@@ -7,7 +7,6 @@ warnings.filterwarnings('ignore')
 
 def clean_header(val):
     if not val: return ""
-    # 统一转小写，去除中英文括号，并用正则清除所有空格和换行符(\n)
     s = str(val).strip().lower()
     s = s.replace('（', '(').replace('）', ')')
     s = re.sub(r'\s+', '', s) 
@@ -15,7 +14,6 @@ def clean_header(val):
 
 def find_col(sheet, exact_names, excludes=None):
     excludes = excludes or []
-    # 第一轮：完全精确匹配 (最高优先级)
     for col in range(1, 150):
         for r in [1, 2]:
             val = sheet.cell(row=r, column=col).value
@@ -25,7 +23,6 @@ def find_col(sheet, exact_names, excludes=None):
                 if clean_header(exact) == cleaned:
                     return col
                     
-    # 第二轮：安全的子串匹配
     for col in range(1, 150):
         for r in [1, 2]:
             val = sheet.cell(row=r, column=col).value
@@ -34,10 +31,8 @@ def find_col(sheet, exact_names, excludes=None):
             for exact in exact_names:
                 target = clean_header(exact)
                 if target in cleaned:
-                    # 排除特定关键字，防止列名错位
                     if any(clean_header(ex) in cleaned for ex in excludes):
                         continue
-                    # 严格防线：避免 sku 错误匹配到 msku，店铺匹配到 店铺&msku
                     if target == 'sku' and 'msku' in cleaned: continue
                     if target == 'msku' and '店铺' in cleaned: continue
                     if target == '店铺' and 'msku' in cleaned: continue
@@ -102,9 +97,6 @@ def extract_sku_smart(msku, sku_set):
     return ''
 
 def step2_fill_and_calculate(intermediate_file, product_file_obj):
-    """
-    模块二：遍历所有行，拆分SKU，回填所有细分数量指标，计算公式。
-    """
     sku_set, sku_to_name = load_product_reference(product_file_obj)
     wb = openpyxl.load_workbook(intermediate_file)
     sheets = wb.sheetnames
@@ -139,7 +131,6 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
         c_a3 = find_col(w_sh, ['3个月内库龄(数量)'])
         c_a6 = find_col(w_sh, ['3-6个月库龄(数量)'])
         
-        # 兼容WFS表可能的库龄格式
         c_a6_9 = find_col(w_sh, ['6-9个月库龄(数量)'])
         c_a9_12 = find_col(w_sh, ['9-12个月库龄(数量)'])
         c_a6_plus = find_col(w_sh, ['6个月以上库龄(数量)'])
@@ -149,7 +140,6 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
             wh = str(w_sh.cell(r, c_wh).value or '').strip()
             msku = str(w_sh.cell(r, c_msku).value or '').strip()
             if wh and msku:
-                # 智能计算 6个月以上 的库龄 (如果原表拆分了 6-9 和 9-12 就加起来)
                 v_a6_9 = get_numeric_value(w_sh.cell(r, c_a6_9)) if c_a6_9 else 0
                 v_a9_12 = get_numeric_value(w_sh.cell(r, c_a9_12)) if c_a9_12 else 0
                 v_12p = get_numeric_value(w_sh.cell(r, c_a12p)) if c_a12p else 0
@@ -166,7 +156,7 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
                     '在途': get_numeric_value(w_sh.cell(r, c_transit)) if c_transit else 0,
                     '库龄3': get_numeric_value(w_sh.cell(r, c_a3)) if c_a3 else 0,
                     '库龄6': get_numeric_value(w_sh.cell(r, c_a6)) if c_a6 else 0,
-                    '库龄12': v_6plus, # 对应"6个月以上库龄"
+                    '库龄12': v_6plus, 
                     '库龄超12': v_12p,
                 }
 
@@ -184,28 +174,39 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
             if msku:
                 sales_full[f"{store}{msku}"] = get_numeric_value(s_sh.cell(r, s_subtotal))
 
-    # --- 获取深圳与采购数据 ---
+    # --- 获取深圳与采购数据 (修复：加入精确条件过滤) ---
     sz_full, po_full = {}, {}
     if sz_sheet_name:
         sz_sh = wb[sz_sheet_name]
         sz_sku = find_col(sz_sh, ['SKU'], excludes=['msku']) or 1
-        sz_qty = find_col(sz_sh, ['实际可用', '可用']) or 10
+        sz_qty = find_col(sz_sh, ['可用库存', '实际可用', '可用']) or 8
+        sz_wh = find_col(sz_sh, ['仓库名称', '仓库']) or 4 # 定位仓库名称列
+        
         for r in range(2, sz_sh.max_row + 1):
             sku = str(sz_sh.cell(r, sz_sku).value or '').strip()
-            if sku: sz_full[sku] = sz_full.get(sku, 0) + get_numeric_value(sz_sh.cell(r, sz_qty))
+            wh_name = str(sz_sh.cell(r, sz_wh).value or '').strip()
+            
+            # 严格过滤：只有包含“沃尔玛深圳仓”的库存才会被计入
+            if sku and '沃尔玛深圳仓' in wh_name: 
+                sz_full[sku] = sz_full.get(sku, 0) + get_numeric_value(sz_sh.cell(r, sz_qty))
 
     if po_sheet_name:
         po_sh = wb[po_sheet_name]
         po_sku = find_col(po_sh, ['SKU'], excludes=['msku']) or 7
         po_qty = find_col(po_sh, ['未入库量', '未入库']) or 19
+        po_req = find_col(po_sh, ['需求人']) or 28 # 定位需求人列
+        
         for r in range(2, po_sh.max_row + 1):
             sku = str(po_sh.cell(r, po_sku).value or '').strip()
-            if sku: po_full[sku] = po_full.get(sku, 0) + get_numeric_value(po_sh.cell(r, po_qty))
+            requester = str(po_sh.cell(r, po_req).value or '').strip()
+            
+            # 严格过滤：只有需求人是“陈丹丹”的采购单才会被计入
+            if sku and '陈丹丹' in requester: 
+                po_full[sku] = po_full.get(sku, 0) + get_numeric_value(po_sh.cell(r, po_qty))
 
     # --- 注入主表与计算 ---
     inv_sh = wb[inv_sheet_name]
     
-    # 彻底杜绝列名串位
     i_store = find_col(inv_sh, ['店铺'], excludes=['msku']) or 1
     i_msku = find_col(inv_sh, ['msku'], excludes=['店铺']) or 2
     i_sku = find_col(inv_sh, ['sku'], excludes=['msku'])
@@ -250,20 +251,15 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
         
         key = f"{store}{msku}"
         
-        # --- 智能获取或拆分 SKU ---
         curr_sku = str(inv_sh.cell(r, i_sku).value or '').strip() if i_sku else ''
         if not curr_sku:
-            # 如果没SKU，优先尝试从WFS抓取
             if key in wfs_full and wfs_full[key]['SKU']:
                 curr_sku = wfs_full[key]['SKU']
-            # 如果WFS也没有，则根据MSKU智能拆分
             elif msku:
                 curr_sku = extract_sku_smart(msku, sku_set)
-            # 填回表格
             if i_sku and curr_sku: 
                 inv_sh.cell(r, i_sku, curr_sku)
         
-        # --- 智能补全品名 ---
         curr_name = str(inv_sh.cell(r, i_name).value or '').strip() if i_name else ''
         if not curr_name:
             if key in wfs_full and wfs_full[key]['品名']:
@@ -275,7 +271,6 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
                 
         v_wfs = v_unable = v_transit = v_sz = v_po = v_sales = 0
         
-        # 写入全部字段
         if key in wfs_full:
             d = wfs_full[key]
             v_wfs, v_unable, v_transit = d['可售'], d['无法'], d['在途']
@@ -304,7 +299,6 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
                 v_po = po_full[curr_sku]
                 if i_po: inv_sh.cell(r, i_po, v_po)
                 
-        # 重新写入公式
         if i_total:
             inv_sh.cell(r, i_total, v_wfs + v_unable + v_transit + v_sz)
             
