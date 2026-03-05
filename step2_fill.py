@@ -14,6 +14,7 @@ def clean_header(val):
 
 def find_col(sheet, exact_names, excludes=None):
     excludes = excludes or []
+    # 1. 优先精确匹配
     for col in range(1, 150):
         for r in [1, 2]:
             val = sheet.cell(row=r, column=col).value
@@ -23,6 +24,7 @@ def find_col(sheet, exact_names, excludes=None):
                 if clean_header(exact) == cleaned:
                     return col
                     
+    # 2. 安全模糊匹配
     for col in range(1, 150):
         for r in [1, 2]:
             val = sheet.cell(row=r, column=col).value
@@ -38,6 +40,16 @@ def find_col(sheet, exact_names, excludes=None):
                     if target == '店铺' and 'msku' in cleaned: continue
                     return col
     return None
+
+def get_real_max_col(sheet, row_idx=2):
+    """寻找真实的最后一列，防止幽灵列导致新加的列跑到16384列外去"""
+    max_c = 1
+    for c in range(150, 0, -1):
+        val = sheet.cell(row=row_idx, column=c).value
+        if val is not None and str(val).strip() != "":
+            max_c = c
+            break
+    return max_c
 
 def get_numeric_value(cell):
     if cell is None or cell.value is None: return 0
@@ -78,32 +90,26 @@ def load_product_reference(product_file_obj):
     except: return set(), {}
 
 def extract_sku_smart(msku, sku_set):
-    """强制增强的 SKU 拆分与匹配系统"""
     if not msku: return ''
     parts = [p.strip() for p in msku.split('-') if p.strip()]
     if not parts: return ''
     
-    # 如果没上传产品资料，简单提取
     if not sku_set:
         return parts[1] if len(parts) >= 2 else parts[0]
         
-    # 1. 精确匹配产品资料
     for p in parts:
         if p in sku_set: return p
         
-    # 2. 去特殊字符匹配
     cleaned = [p.replace('"', '').replace("'", '').replace(' ', '') for p in parts]
     for p in cleaned:
         if p in sku_set: return p
         
-    # 3. 模糊匹配
     for p in cleaned:
         if len(p) >= 4 and re.search(r'\d', p) and re.search(r'[a-zA-Z]', p):
             for sku in sku_set:
                 if p in sku or sku in p:
                     if len(sku) > 0 and len(p)/len(sku) >= 0.6: return sku
                     
-    # 4. 兜底逻辑：如果产品资料里实在没有，提取最像SKU的字符串（含字母+数字的最长串）
     candidates = [p for p in cleaned if re.search(r'\d', p) and re.search(r'[a-zA-Z]', p)]
     if candidates:
         return max(candidates, key=len)
@@ -242,9 +248,11 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
     i_turn_transit = find_col(inv_sh, ['WFS在途+在库周转'])
     i_turn_total = find_col(inv_sh, ['总周转天数（不含采购订单）', '总周转'])
     
+    # 【重点修复 1】：防幽灵列寻找真实最后列，并在表头拼接新增的“销量明细”列
     i_sales = find_col(inv_sh, [sales_sheet_name])
     if not i_sales:
-        i_sales = inv_sh.max_column + 1
+        real_max_col = get_real_max_col(inv_sh, 2)
+        i_sales = real_max_col + 1
         inv_sh.cell(2, i_sales, sales_sheet_name)
 
     empty_count = 0
@@ -260,21 +268,15 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
         
         key = f"{store}{msku}"
         
-        # --- 强力修改：优先拆分提取真实 SKU ---
+        # 补全 SKU 和 品名
         curr_sku = str(inv_sh.cell(r, i_sku).value or '').strip() if i_sku else ''
         if not curr_sku and msku:
-            # 1. 强制优先：对 MSKU 进行拆分并与产品资料匹配
             curr_sku = extract_sku_smart(msku, sku_set)
-            
-            # 2. 如果彻底拆分失败（可能性极低），才退而求其次抓 WFS 里的 SKU
             if not curr_sku and key in wfs_full and wfs_full[key]['SKU']:
                 curr_sku = wfs_full[key]['SKU']
-                
-            # 把正确的 SKU 回填表格
             if i_sku and curr_sku: 
                 inv_sh.cell(r, i_sku, curr_sku)
         
-        # 智能补全品名
         curr_name = str(inv_sh.cell(r, i_name).value or '').strip() if i_name else ''
         if not curr_name:
             if key in wfs_full and wfs_full[key]['品名']:
@@ -284,45 +286,51 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
             if i_name and curr_name:
                 inv_sh.cell(r, i_name, curr_name)
                 
-        v_wfs = v_unable = v_transit = v_sz = v_po = v_sales = 0
-        
+        # 更新该行数据
         if key in wfs_full:
             d = wfs_full[key]
-            v_wfs, v_unable, v_transit = d['可售'], d['无法'], d['在途']
-            
             if i_pid and d['平台商品ID']: inv_sh.cell(r, i_pid, d['平台商品ID'])
             if i_gtin and d['GTIN']: inv_sh.cell(r, i_gtin, d['GTIN'])
             if i_status and d['状态']: inv_sh.cell(r, i_status, d['状态'])
             
-            if i_avail: inv_sh.cell(r, i_avail, v_wfs)
-            if i_unable: inv_sh.cell(r, i_unable, v_unable)
-            if i_transit: inv_sh.cell(r, i_transit, v_transit)
+            if i_avail: inv_sh.cell(r, i_avail, d['可售'])
+            if i_unable: inv_sh.cell(r, i_unable, d['无法'])
+            if i_transit: inv_sh.cell(r, i_transit, d['在途'])
             if i_a3: inv_sh.cell(r, i_a3, d['库龄3'])
             if i_a6: inv_sh.cell(r, i_a6, d['库龄6'])
             if i_a12: inv_sh.cell(r, i_a12, d['库龄12'])
             if i_a12p: inv_sh.cell(r, i_a12p, d['库龄超12'])
             
         if key in sales_full:
-            v_sales = sales_full[key]
-            if i_sales: inv_sh.cell(r, i_sales, v_sales)
+            if i_sales: inv_sh.cell(r, i_sales, sales_full[key])
             
-        # --- 深圳仓和采购计算（现依赖精准提取的 curr_sku） ---
         if curr_sku:
             if curr_sku in sz_full:
-                v_sz = sz_full[curr_sku]
-                if i_sz: inv_sh.cell(r, i_sz, v_sz)
+                if i_sz: inv_sh.cell(r, i_sz, sz_full[curr_sku])
             if curr_sku in po_full:
-                v_po = po_full[curr_sku]
-                if i_po: inv_sh.cell(r, i_po, v_po)
+                if i_po: inv_sh.cell(r, i_po, po_full[curr_sku])
                 
+        # 【重点修复 2】：先从单元格中读取当前最新值，然后再进行严格的计算！
+        v_wfs = get_numeric_value(inv_sh.cell(r, i_avail)) if i_avail else 0
+        v_unable = get_numeric_value(inv_sh.cell(r, i_unable)) if i_unable else 0
+        v_transit = get_numeric_value(inv_sh.cell(r, i_transit)) if i_transit else 0
+        v_sz = get_numeric_value(inv_sh.cell(r, i_sz)) if i_sz else 0
+        v_sales = get_numeric_value(inv_sh.cell(r, i_sales)) if i_sales else 0
+                
+        # 1. 计算总库存（不含采购订单） = WFS可售(新) + 无法入库 + 标发在途 + 深圳仓
         if i_total:
             inv_sh.cell(r, i_total, v_wfs + v_unable + v_transit + v_sz)
             
+        # 2. 严格按 Skill 公式计算周转率
         if v_sales > 0:
-            if i_turn_wfs: inv_sh.cell(r, i_turn_wfs, round(v_wfs / v_sales * 30, 2))
-            if i_turn_transit: inv_sh.cell(r, i_turn_transit, round((v_wfs + v_transit) / v_sales * 30, 2))
-            if i_turn_total: inv_sh.cell(r, i_turn_total, round((v_wfs + v_transit + v_sz) / v_sales * 30, 2))
+            if i_turn_wfs: 
+                inv_sh.cell(r, i_turn_wfs, round(v_wfs / v_sales * 30, 2))
+            if i_turn_transit: 
+                inv_sh.cell(r, i_turn_transit, round((v_wfs + v_transit) / v_sales * 30, 2))
+            if i_turn_total: 
+                inv_sh.cell(r, i_turn_total, round((v_wfs + v_transit + v_sz) / v_sales * 30, 2))
         else:
+            # 销量为0时返回空值
             if i_turn_wfs: inv_sh.cell(r, i_turn_wfs, "")
             if i_turn_transit: inv_sh.cell(r, i_turn_transit, "")
             if i_turn_total: inv_sh.cell(r, i_turn_total, "")
