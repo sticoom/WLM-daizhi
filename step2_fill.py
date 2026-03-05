@@ -78,23 +78,37 @@ def load_product_reference(product_file_obj):
     except: return set(), {}
 
 def extract_sku_smart(msku, sku_set):
+    """强制增强的 SKU 拆分与匹配系统"""
     if not msku: return ''
-    if not sku_set:
-        parts = msku.split('-')
-        return parts[1] if len(parts) >= 2 else parts[0]
     parts = [p.strip() for p in msku.split('-') if p.strip()]
+    if not parts: return ''
+    
+    # 如果没上传产品资料，简单提取
+    if not sku_set:
+        return parts[1] if len(parts) >= 2 else parts[0]
+        
+    # 1. 精确匹配产品资料
     for p in parts:
         if p in sku_set: return p
+        
+    # 2. 去特殊字符匹配
     cleaned = [p.replace('"', '').replace("'", '').replace(' ', '') for p in parts]
     for p in cleaned:
         if p in sku_set: return p
+        
+    # 3. 模糊匹配
     for p in cleaned:
         if len(p) >= 4 and re.search(r'\d', p) and re.search(r'[a-zA-Z]', p):
-            if p in sku_set: return p
             for sku in sku_set:
                 if p in sku or sku in p:
                     if len(sku) > 0 and len(p)/len(sku) >= 0.6: return sku
-    return ''
+                    
+    # 4. 兜底逻辑：如果产品资料里实在没有，提取最像SKU的字符串（含字母+数字的最长串）
+    candidates = [p for p in cleaned if re.search(r'\d', p) and re.search(r'[a-zA-Z]', p)]
+    if candidates:
+        return max(candidates, key=len)
+        
+    return parts[1] if len(parts) >= 2 else parts[0]
 
 def step2_fill_and_calculate(intermediate_file, product_file_obj):
     sku_set, sku_to_name = load_product_reference(product_file_obj)
@@ -130,7 +144,6 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
         c_transit = find_col(w_sh, ['标发在途(数量)'])
         c_a3 = find_col(w_sh, ['3个月内库龄(数量)'])
         c_a6 = find_col(w_sh, ['3-6个月库龄(数量)'])
-        
         c_a6_9 = find_col(w_sh, ['6-9个月库龄(数量)'])
         c_a9_12 = find_col(w_sh, ['9-12个月库龄(数量)'])
         c_a6_plus = find_col(w_sh, ['6个月以上库龄(数量)'])
@@ -174,19 +187,17 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
             if msku:
                 sales_full[f"{store}{msku}"] = get_numeric_value(s_sh.cell(r, s_subtotal))
 
-    # --- 获取深圳与采购数据 (修复：加入精确条件过滤) ---
+    # --- 获取深圳与采购数据 ---
     sz_full, po_full = {}, {}
     if sz_sheet_name:
         sz_sh = wb[sz_sheet_name]
         sz_sku = find_col(sz_sh, ['SKU'], excludes=['msku']) or 1
         sz_qty = find_col(sz_sh, ['可用库存', '实际可用', '可用']) or 8
-        sz_wh = find_col(sz_sh, ['仓库名称', '仓库']) or 4 # 定位仓库名称列
+        sz_wh = find_col(sz_sh, ['仓库名称', '仓库']) or 4 
         
         for r in range(2, sz_sh.max_row + 1):
             sku = str(sz_sh.cell(r, sz_sku).value or '').strip()
             wh_name = str(sz_sh.cell(r, sz_wh).value or '').strip()
-            
-            # 严格过滤：只有包含“沃尔玛深圳仓”的库存才会被计入
             if sku and '沃尔玛深圳仓' in wh_name: 
                 sz_full[sku] = sz_full.get(sku, 0) + get_numeric_value(sz_sh.cell(r, sz_qty))
 
@@ -194,13 +205,11 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
         po_sh = wb[po_sheet_name]
         po_sku = find_col(po_sh, ['SKU'], excludes=['msku']) or 7
         po_qty = find_col(po_sh, ['未入库量', '未入库']) or 19
-        po_req = find_col(po_sh, ['需求人']) or 28 # 定位需求人列
+        po_req = find_col(po_sh, ['需求人']) or 28 
         
         for r in range(2, po_sh.max_row + 1):
             sku = str(po_sh.cell(r, po_sku).value or '').strip()
             requester = str(po_sh.cell(r, po_req).value or '').strip()
-            
-            # 严格过滤：只有需求人是“陈丹丹”的采购单才会被计入
             if sku and '陈丹丹' in requester: 
                 po_full[sku] = po_full.get(sku, 0) + get_numeric_value(po_sh.cell(r, po_qty))
 
@@ -251,15 +260,21 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
         
         key = f"{store}{msku}"
         
+        # --- 强力修改：优先拆分提取真实 SKU ---
         curr_sku = str(inv_sh.cell(r, i_sku).value or '').strip() if i_sku else ''
-        if not curr_sku:
-            if key in wfs_full and wfs_full[key]['SKU']:
+        if not curr_sku and msku:
+            # 1. 强制优先：对 MSKU 进行拆分并与产品资料匹配
+            curr_sku = extract_sku_smart(msku, sku_set)
+            
+            # 2. 如果彻底拆分失败（可能性极低），才退而求其次抓 WFS 里的 SKU
+            if not curr_sku and key in wfs_full and wfs_full[key]['SKU']:
                 curr_sku = wfs_full[key]['SKU']
-            elif msku:
-                curr_sku = extract_sku_smart(msku, sku_set)
+                
+            # 把正确的 SKU 回填表格
             if i_sku and curr_sku: 
                 inv_sh.cell(r, i_sku, curr_sku)
         
+        # 智能补全品名
         curr_name = str(inv_sh.cell(r, i_name).value or '').strip() if i_name else ''
         if not curr_name:
             if key in wfs_full and wfs_full[key]['品名']:
@@ -291,6 +306,7 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
             v_sales = sales_full[key]
             if i_sales: inv_sh.cell(r, i_sales, v_sales)
             
+        # --- 深圳仓和采购计算（现依赖精准提取的 curr_sku） ---
         if curr_sku:
             if curr_sku in sz_full:
                 v_sz = sz_full[curr_sku]
