@@ -1,4 +1,3 @@
-# step2_fill.py
 import openpyxl
 import io
 import re
@@ -8,15 +7,41 @@ warnings.filterwarnings('ignore')
 
 def clean_header(val):
     if not val: return ""
-    return str(val).strip().replace('（', '(').replace('）', ')').replace(' ', '')
+    # 统一转小写，去除中英文括号，并用正则清除所有空格和换行符(\n)
+    s = str(val).strip().lower()
+    s = s.replace('（', '(').replace('）', ')')
+    s = re.sub(r'\s+', '', s) 
+    return s
 
-def find_exact_col(sheet, exact_name):
-    target = clean_header(exact_name)
-    for col in range(1, 100):
-        val1 = sheet.cell(row=1, column=col).value
-        val2 = sheet.cell(row=2, column=col).value
-        if val1 and target in clean_header(val1): return col
-        if val2 and target in clean_header(val2): return col
+def find_col(sheet, exact_names, excludes=None):
+    excludes = excludes or []
+    # 第一轮：完全精确匹配 (最高优先级)
+    for col in range(1, 150):
+        for r in [1, 2]:
+            val = sheet.cell(row=r, column=col).value
+            if not val: continue
+            cleaned = clean_header(val)
+            for exact in exact_names:
+                if clean_header(exact) == cleaned:
+                    return col
+                    
+    # 第二轮：安全的子串匹配
+    for col in range(1, 150):
+        for r in [1, 2]:
+            val = sheet.cell(row=r, column=col).value
+            if not val: continue
+            cleaned = clean_header(val)
+            for exact in exact_names:
+                target = clean_header(exact)
+                if target in cleaned:
+                    # 排除特定关键字，防止列名错位
+                    if any(clean_header(ex) in cleaned for ex in excludes):
+                        continue
+                    # 严格防线：避免 sku 错误匹配到 msku，店铺匹配到 店铺&msku
+                    if target == 'sku' and 'msku' in cleaned: continue
+                    if target == 'msku' and '店铺' in cleaned: continue
+                    if target == '店铺' and 'msku' in cleaned: continue
+                    return col
     return None
 
 def get_numeric_value(cell):
@@ -95,44 +120,63 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
     po_sheet_name = find_sheet(['采购订单', '采购', '在途'])
     sales_sheet_name = sheets[4] if len(sheets) > 4 else None
 
-    # --- 获取全量数据 ---
+    # --- 获取 WFS 全量数据 ---
     wfs_full = {}
     if wfs_sheet_name:
         w_sh = wb[wfs_sheet_name]
-        c_wh = find_exact_col(w_sh, '仓库') or 1
-        c_msku = find_exact_col(w_sh, 'msku') or 2
-        c_gtin = find_exact_col(w_sh, 'GTIN码')
-        c_status = find_exact_col(w_sh, '商品状态')
-        c_avail = find_exact_col(w_sh, 'WFS可售(新)(数量)')
-        c_unable = find_exact_col(w_sh, '无法入库(数量)')
-        c_transit = find_exact_col(w_sh, '标发在途(数量)')
-        c_a3 = find_exact_col(w_sh, '3个月内库龄(数量)')
-        c_a6 = find_exact_col(w_sh, '3-6个月库龄(数量)')
-        c_a12 = find_exact_col(w_sh, '6个月以上库龄(数量)')
-        c_a12p = find_exact_col(w_sh, '12个月以上库龄(数量)')
+        c_wh = find_col(w_sh, ['仓库', 'warehouse']) or 1
+        c_msku = find_col(w_sh, ['msku']) or 2
+        
+        c_pid = find_col(w_sh, ['平台商品ID', '商品ID'], excludes=['gtin'])
+        c_gtin = find_col(w_sh, ['GTIN码', 'gtin'])
+        c_name = find_col(w_sh, ['品名'])
+        c_sku = find_col(w_sh, ['sku'], excludes=['msku'])
+        c_status = find_col(w_sh, ['商品状态'])
+        
+        c_avail = find_col(w_sh, ['WFS可售(新)(数量)'])
+        c_unable = find_col(w_sh, ['无法入库(数量)'])
+        c_transit = find_col(w_sh, ['标发在途(数量)'])
+        c_a3 = find_col(w_sh, ['3个月内库龄(数量)'])
+        c_a6 = find_col(w_sh, ['3-6个月库龄(数量)'])
+        
+        # 兼容WFS表可能的库龄格式
+        c_a6_9 = find_col(w_sh, ['6-9个月库龄(数量)'])
+        c_a9_12 = find_col(w_sh, ['9-12个月库龄(数量)'])
+        c_a6_plus = find_col(w_sh, ['6个月以上库龄(数量)'])
+        c_a12p = find_col(w_sh, ['12个月以上库龄(数量)'])
 
         for r in range(2, w_sh.max_row + 1):
             wh = str(w_sh.cell(r, c_wh).value or '').strip()
             msku = str(w_sh.cell(r, c_msku).value or '').strip()
             if wh and msku:
+                # 智能计算 6个月以上 的库龄 (如果原表拆分了 6-9 和 9-12 就加起来)
+                v_a6_9 = get_numeric_value(w_sh.cell(r, c_a6_9)) if c_a6_9 else 0
+                v_a9_12 = get_numeric_value(w_sh.cell(r, c_a9_12)) if c_a9_12 else 0
+                v_12p = get_numeric_value(w_sh.cell(r, c_a12p)) if c_a12p else 0
+                v_6plus = get_numeric_value(w_sh.cell(r, c_a6_plus)) if c_a6_plus else (v_a6_9 + v_a9_12 + v_12p)
+                
                 wfs_full[f"{wh}{msku}"] = {
+                    '平台商品ID': str(w_sh.cell(r, c_pid).value or '') if c_pid else '',
                     'GTIN': str(w_sh.cell(r, c_gtin).value or '') if c_gtin else '',
+                    '品名': str(w_sh.cell(r, c_name).value or '').strip() if c_name else '',
+                    'SKU': str(w_sh.cell(r, c_sku).value or '').strip() if c_sku else '',
                     '状态': w_sh.cell(r, c_status).value if c_status else '',
                     '可售': get_numeric_value(w_sh.cell(r, c_avail)) if c_avail else 0,
                     '无法': get_numeric_value(w_sh.cell(r, c_unable)) if c_unable else 0,
                     '在途': get_numeric_value(w_sh.cell(r, c_transit)) if c_transit else 0,
                     '库龄3': get_numeric_value(w_sh.cell(r, c_a3)) if c_a3 else 0,
                     '库龄6': get_numeric_value(w_sh.cell(r, c_a6)) if c_a6 else 0,
-                    '库龄12': get_numeric_value(w_sh.cell(r, c_a12)) if c_a12 else 0,
-                    '库龄超12': get_numeric_value(w_sh.cell(r, c_a12p)) if c_a12p else 0,
+                    '库龄12': v_6plus, # 对应"6个月以上库龄"
+                    '库龄超12': v_12p,
                 }
 
+    # --- 获取销量数据 ---
     sales_full = {}
     if sales_sheet_name:
         s_sh = wb[sales_sheet_name]
-        s_msku = find_exact_col(s_sh, 'MSKU') or 4
-        s_store = find_exact_col(s_sh, '店铺') or 3
-        s_subtotal = find_exact_col(s_sh, '小计') or 13
+        s_msku = find_col(s_sh, ['MSKU']) or 4
+        s_store = find_col(s_sh, ['店铺']) or 3
+        s_subtotal = find_col(s_sh, ['小计']) or 13
         for r in range(2, s_sh.max_row + 1):
             msku = str(s_sh.cell(r, s_msku).value or '').strip()
             store = str(s_sh.cell(r, s_store).value or '').strip()
@@ -140,19 +184,20 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
             if msku:
                 sales_full[f"{store}{msku}"] = get_numeric_value(s_sh.cell(r, s_subtotal))
 
+    # --- 获取深圳与采购数据 ---
     sz_full, po_full = {}, {}
     if sz_sheet_name:
         sz_sh = wb[sz_sheet_name]
-        sz_sku = find_exact_col(sz_sh, 'SKU') or 1
-        sz_qty = find_exact_col(sz_sh, '实际可用') or find_exact_col(sz_sh, '可用') or 10
+        sz_sku = find_col(sz_sh, ['SKU'], excludes=['msku']) or 1
+        sz_qty = find_col(sz_sh, ['实际可用', '可用']) or 10
         for r in range(2, sz_sh.max_row + 1):
             sku = str(sz_sh.cell(r, sz_sku).value or '').strip()
             if sku: sz_full[sku] = sz_full.get(sku, 0) + get_numeric_value(sz_sh.cell(r, sz_qty))
 
     if po_sheet_name:
         po_sh = wb[po_sheet_name]
-        po_sku = find_exact_col(po_sh, 'SKU') or 7
-        po_qty = find_exact_col(po_sh, '未入库量') or find_exact_col(po_sh, '未入库') or 19
+        po_sku = find_col(po_sh, ['SKU'], excludes=['msku']) or 7
+        po_qty = find_col(po_sh, ['未入库量', '未入库']) or 19
         for r in range(2, po_sh.max_row + 1):
             sku = str(po_sh.cell(r, po_sku).value or '').strip()
             if sku: po_full[sku] = po_full.get(sku, 0) + get_numeric_value(po_sh.cell(r, po_qty))
@@ -160,28 +205,34 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
     # --- 注入主表与计算 ---
     inv_sh = wb[inv_sheet_name]
     
-    i_store = find_exact_col(inv_sh, '店铺') or 1
-    i_msku = find_exact_col(inv_sh, 'msku') or 2
-    i_sku = find_exact_col(inv_sh, 'sku')
-    i_name = find_exact_col(inv_sh, '品名')
-    i_gtin = find_exact_col(inv_sh, 'GTIN码')
-    i_status = find_exact_col(inv_sh, '商品状态')
-    i_avail = find_exact_col(inv_sh, 'WFS可售(新)(数量)')
-    i_unable = find_exact_col(inv_sh, '无法入库(数量)')
-    i_transit = find_exact_col(inv_sh, '标发在途(数量)')
-    i_a3 = find_exact_col(inv_sh, '3个月内库龄(数量)')
-    i_a6 = find_exact_col(inv_sh, '3-6个月库龄(数量)')
-    i_a12 = find_exact_col(inv_sh, '6个月以上库龄(数量)')
-    i_a12p = find_exact_col(inv_sh, '12个月以上库龄(数量)')
-    i_sz = find_exact_col(inv_sh, '深圳仓库存') or find_exact_col(inv_sh, '深圳仓')
-    i_po = find_exact_col(inv_sh, '采购订单在途') or find_exact_col(inv_sh, '采购')
+    # 彻底杜绝列名串位
+    i_store = find_col(inv_sh, ['店铺'], excludes=['msku']) or 1
+    i_msku = find_col(inv_sh, ['msku'], excludes=['店铺']) or 2
+    i_sku = find_col(inv_sh, ['sku'], excludes=['msku'])
     
-    i_total = find_exact_col(inv_sh, '总库存（不含采购订单）') or find_exact_col(inv_sh, '总库存')
-    i_turn_wfs = find_exact_col(inv_sh, 'WFS在库周转')
-    i_turn_transit = find_exact_col(inv_sh, 'WFS在途+在库周转')
-    i_turn_total = find_exact_col(inv_sh, '总周转天数（不含采购订单）') or find_exact_col(inv_sh, '总周转')
+    i_pid = find_col(inv_sh, ['平台商品ID', '商品ID'], excludes=['gtin'])
+    i_name = find_col(inv_sh, ['品名'])
+    i_gtin = find_col(inv_sh, ['GTIN码'])
+    i_status = find_col(inv_sh, ['商品状态'])
     
-    i_sales = find_exact_col(inv_sh, sales_sheet_name)
+    i_avail = find_col(inv_sh, ['WFS可售(新)(数量)'])
+    i_unable = find_col(inv_sh, ['无法入库(数量)'])
+    i_transit = find_col(inv_sh, ['标发在途(数量)'])
+    
+    i_a3 = find_col(inv_sh, ['3个月内库龄(数量)'])
+    i_a6 = find_col(inv_sh, ['3-6个月库龄(数量)'])
+    i_a12 = find_col(inv_sh, ['6个月以上库龄(数量)'])
+    i_a12p = find_col(inv_sh, ['12个月以上库龄(数量)'])
+    
+    i_sz = find_col(inv_sh, ['深圳仓库存', '深圳仓'])
+    i_po = find_col(inv_sh, ['采购订单在途', '采购'])
+    
+    i_total = find_col(inv_sh, ['总库存（不含采购订单）', '总库存'])
+    i_turn_wfs = find_col(inv_sh, ['WFS在库周转'])
+    i_turn_transit = find_col(inv_sh, ['WFS在途+在库周转'])
+    i_turn_total = find_col(inv_sh, ['总周转天数（不含采购订单）', '总周转'])
+    
+    i_sales = find_col(inv_sh, [sales_sheet_name])
     if not i_sales:
         i_sales = inv_sh.max_column + 1
         inv_sh.cell(2, i_sales, sales_sheet_name)
@@ -197,21 +248,42 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
             continue
         empty_count = 0
         
-        curr_sku = str(inv_sh.cell(r, i_sku).value or '').strip() if i_sku else ''
-        if not curr_sku and msku:
-            curr_sku = extract_sku_smart(msku, sku_set)
-            if i_sku and curr_sku: inv_sh.cell(r, i_sku, curr_sku)
-                
-        curr_name = str(inv_sh.cell(r, i_name).value or '').strip() if i_name else ''
-        if not curr_name and curr_sku in sku_to_name and i_name:
-            inv_sh.cell(r, i_name, sku_to_name[curr_sku])
-                
         key = f"{store}{msku}"
+        
+        # --- 智能获取或拆分 SKU ---
+        curr_sku = str(inv_sh.cell(r, i_sku).value or '').strip() if i_sku else ''
+        if not curr_sku:
+            # 如果没SKU，优先尝试从WFS抓取
+            if key in wfs_full and wfs_full[key]['SKU']:
+                curr_sku = wfs_full[key]['SKU']
+            # 如果WFS也没有，则根据MSKU智能拆分
+            elif msku:
+                curr_sku = extract_sku_smart(msku, sku_set)
+            # 填回表格
+            if i_sku and curr_sku: 
+                inv_sh.cell(r, i_sku, curr_sku)
+        
+        # --- 智能补全品名 ---
+        curr_name = str(inv_sh.cell(r, i_name).value or '').strip() if i_name else ''
+        if not curr_name:
+            if key in wfs_full and wfs_full[key]['品名']:
+                curr_name = wfs_full[key]['品名']
+            elif curr_sku in sku_to_name:
+                curr_name = sku_to_name[curr_sku]
+            if i_name and curr_name:
+                inv_sh.cell(r, i_name, curr_name)
+                
         v_wfs = v_unable = v_transit = v_sz = v_po = v_sales = 0
         
+        # 写入全部字段
         if key in wfs_full:
             d = wfs_full[key]
             v_wfs, v_unable, v_transit = d['可售'], d['无法'], d['在途']
+            
+            if i_pid and d['平台商品ID']: inv_sh.cell(r, i_pid, d['平台商品ID'])
+            if i_gtin and d['GTIN']: inv_sh.cell(r, i_gtin, d['GTIN'])
+            if i_status and d['状态']: inv_sh.cell(r, i_status, d['状态'])
+            
             if i_avail: inv_sh.cell(r, i_avail, v_wfs)
             if i_unable: inv_sh.cell(r, i_unable, v_unable)
             if i_transit: inv_sh.cell(r, i_transit, v_transit)
@@ -219,8 +291,6 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
             if i_a6: inv_sh.cell(r, i_a6, d['库龄6'])
             if i_a12: inv_sh.cell(r, i_a12, d['库龄12'])
             if i_a12p: inv_sh.cell(r, i_a12p, d['库龄超12'])
-            if i_gtin and d['GTIN']: inv_sh.cell(r, i_gtin, d['GTIN'])
-            if i_status and d['状态']: inv_sh.cell(r, i_status, d['状态'])
             
         if key in sales_full:
             v_sales = sales_full[key]
@@ -234,6 +304,7 @@ def step2_fill_and_calculate(intermediate_file, product_file_obj):
                 v_po = po_full[curr_sku]
                 if i_po: inv_sh.cell(r, i_po, v_po)
                 
+        # 重新写入公式
         if i_total:
             inv_sh.cell(r, i_total, v_wfs + v_unable + v_transit + v_sz)
             
